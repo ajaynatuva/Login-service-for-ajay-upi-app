@@ -1,0 +1,129 @@
+- name: Continuous Integration
+  hosts: localhost
+  connection: local
+
+  tasks:
+
+  - set_fact:
+      git_username: "{{ lookup('env', 'git_username') }}"
+      git_password: "{{ lookup('env', 'git_password') }}"
+      config_repo: "{{ lookup('env', 'config_repo') }}"
+      service_principal_id: "{{ lookup('env', 'service_principal_id') }}"
+      service_principal_secret: "{{ lookup('env', 'service_principal_secret') }}"
+      subscription_id: "{{ lookup('env', 'subscription_id') }}"
+      tenant_id: "{{ lookup('env', 'tenant_id') }}"
+      source_dir: "{{ lookup('env', 'source_dir') }}"
+      env_dir: "{{ lookup('env', 'env_dir') }}"
+
+  - name: Login to Azure using Service Principal {{ service_principal_id }}
+    command: >
+      az login
+      --service-principal
+      --username '{{ service_principal_id }}'
+      --password '{{ service_principal_secret }}'
+      --tenant '{{ tenant_id }}'
+
+  - name: Set subscription {{ subscription_id }} to be current and active
+    command: az account set --subscription {{ subscription_id }}
+
+  - name: Git pull repo - {{ config_repo }}
+    git:
+      repo: 'https://{{ git_username }}:{{ git_password }}@{{ config_repo }}'
+      dest: "{{ env_dir }}"
+      version: "master"
+
+  - name: Decrypt shared config file
+    shell: sops --decrypt {{ env_dir }}/shared/shared_config.enc.yaml > {{ env_dir }}/shared/shared_config.yaml
+    no_log: true
+
+  - name: Include shared config file
+    include_vars:
+      file: "{{ env_dir }}/shared/shared_config.yaml"
+    no_log: true
+
+  - name: Decrypt ipu user service config
+    shell: sops --decrypt {{ env_dir }}/services/ipu_user_service_config.enc.yaml > {{ env_dir }}/services/ipu_user_service_config.yaml
+    no_log: true
+
+  - name: Include ipu user service config file
+    include_vars:
+      file: "{{ env_dir }}/services/ipu_user_service_config.yaml"
+    no_log: true
+
+  - name: Login to ACR ({{ docker_registry }})
+    shell: echo "{{ service_principal_secret }}" | docker login {{ docker_registry }} --username "{{ service_principal_id }}" --password-stdin
+
+  - name: MVN clean install
+    command: mvn clean install
+    args:
+      chdir: "{{ source_dir }}"
+
+  - name: Setup settings.xml file
+    template:
+      src: "{{ source_dir }}/cicd/ansible/templates/settings.xml.j2"
+      dest: "{{ source_dir }}/settings.xml"
+
+  - name: Publish Artifact to Azure DevOps
+    command: mvn deploy -s settings.xml
+    args:
+      chdir: "{{ source_dir }}"
+
+  - name: MVN set package version
+    set_fact:
+      version: "{{ lookup('ini', 'version type=properties file={{ source_dir }}/target/classes/project.properties') }}"
+
+  - name: Set version variable from package.json output
+    set_fact:
+      version: "{{ version }}"
+
+  - name: Build Docker Image on Build Agent
+    command: docker build -t tmp .
+    args:
+      chdir: "{{ source_dir }}"
+
+  - name: Tag Docker Image on Build Agent
+    command: docker tag tmp {{ docker_registry }}/{{ service_name }}:{{ item }}
+    loop:
+      - latest
+      - "{{ version }}"
+
+  - name: Push Docker Image to ACR
+    command: docker push {{ docker_registry }}/{{ service_name }}:{{ item }}
+    loop:
+      - latest
+      - "{{ version }}"
+
+  - name: Connect to Helm Registry
+    shell: >
+      echo "{{ service_principal_secret }}" | helm registry login {{ docker_registry }}
+      --username "{{ service_principal_id }}" --password-stdin
+    register: connect_helm
+    until: connect_helm.rc == 0
+    retries: 3
+    delay: 15
+
+#Work-around for helm chart save see > https://github.com/helm/helm/issues/7032
+  - name: Overwrite helm chart version
+    template:
+      src: "{{ source_dir }}/charts/{{ service_name }}/Chart.yaml.j2"
+      dest: "{{ source_dir }}/charts/{{ service_name }}/Chart.yaml"
+
+  - name: Save Helm Chart
+    command: helm chart save . {{ docker_registry }}/helm/{{ service_name }}:{{ item }}
+    args:
+      chdir: "{{ source_dir }}/charts/{{ service_name }}"
+    loop:
+      - latest
+      - "{{ version }}"
+
+  - name: Push Helm Template to ACR
+    command: helm chart push {{ docker_registry }}/helm/{{ service_name }}:{{ item }}
+    loop:
+      - latest
+      - "{{ version }}"
+
+  - name: Validate ACR has chart
+    command: az acr repository show --name {{ acr_name }} --image helm/{{ service_name }}:{{ item }}
+    loop:
+      - latest
+      - "{{ version }}"

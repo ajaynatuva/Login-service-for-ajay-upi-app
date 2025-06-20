@@ -1,0 +1,4 @@
+apiVersion: v1
+description: ipu-user-service Helm chart for Kubernetes
+name: ipu-user-service
+version: ${version}

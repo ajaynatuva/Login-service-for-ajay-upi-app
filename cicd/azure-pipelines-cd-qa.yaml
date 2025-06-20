@@ -1,0 +1,61 @@
+name: $(Date:yyyyMMdd)$(Rev:.r)
+
+trigger: none
+
+pr: none
+
+resources:
+  repositories:
+    - repository: templates
+      name: advancedpricing/azure-custom-templates
+      type: bitbucket
+      ref: refs/heads/master
+      endpoint: 'global_devops'
+
+variables:
+  - group: AMPS - QA
+  - group: AMPS - Constants
+  - name: 'Email_recipient'
+    value: 'devteam_hyd@amps.com'
+
+parameters:
+  - name: version
+    displayName: version
+    type: string
+    default: ''
+
+stages:
+- stage: Build
+  jobs:
+    - job: IPU_User_Service_CD
+      pool:
+        vmImage: 'ubuntu-22.04'
+      container:
+        image: "advancedpricing.azurecr.io/devops/services-build:2.0.4"
+        endpoint: 'AMPS Docker Registry'
+
+      steps:
+        - task: Bash@3
+          displayName: 'Run Ansible - IPU User Service Deploy'
+          env:
+            git_username: "$(git_username)"
+            git_password: "$(git_password)"
+            config_repo: "$(config_repo)"
+            service_principal_id: "$(service_principal_id)"
+            service_principal_secret: "$(service_principal_secret)"
+            subscription_id: "$(subscription_id)"
+            tenant_id: "$(tenant_id)"
+            version: "${{ parameters.version }}"
+            source_dir: "$(Build.SourcesDirectory)"
+            env_dir: "$(Agent.BuildDirectory)/env"
+            HELM_EXPERIMENTAL_OCI: 1
+          inputs:
+            targetType: 'inline'
+            script: |
+              ansible-playbook cicd/ansible/cd.yaml -i "localhost, " -v
+- template: templates/stages/send_email_cd.yaml@templates
+  parameters:
+    stagename1: 'Build'
+    Environment: 'QA'
+    version: "${{ parameters.version }}"
+    Email_recipient: '$(Email_recipient)'

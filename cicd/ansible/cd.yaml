@@ -1,0 +1,160 @@
+- name: Continuous Deployment
+  hosts: localhost
+  connection: local
+
+  tasks:
+
+  - set_fact:
+      git_username: "{{ lookup('env', 'git_username') }}"
+      git_password: "{{ lookup('env', 'git_password') }}"
+      config_repo: "{{ lookup('env', 'config_repo') }}"
+      service_principal_id: "{{ lookup('env', 'service_principal_id') }}"
+      service_principal_secret: "{{ lookup('env', 'service_principal_secret') }}"
+      subscription_id: "{{ lookup('env', 'subscription_id') }}"
+      tenant_id: "{{ lookup('env', 'tenant_id') }}"
+      version: "{{ lookup('env', 'version') }}"
+      source_dir: "{{ lookup('env', 'source_dir') }}"
+      env_dir: "{{ lookup('env', 'env_dir') }}"
+
+  - name: Login to Azure using Service Principal {{ service_principal_id }}
+    command: >
+      az login
+      --service-principal
+      --username '{{ service_principal_id }}'
+      --password '{{ service_principal_secret }}'
+      --tenant '{{ tenant_id }}'
+
+  - name: Set subscription {{ subscription_id }} to be current and active
+    command: az account set --subscription {{ subscription_id }}
+
+  - name: Git pull repo - {{ config_repo }}
+    git:
+      repo: 'https://{{ git_username }}:{{ git_password }}@{{ config_repo }}'
+      dest: "{{ env_dir }}"
+      version: "master"
+
+  - name: Decrypt shared config file
+    shell: sops --decrypt {{ env_dir }}/shared/shared_config.enc.yaml > {{ env_dir }}/shared/shared_config.yaml
+    no_log: true
+
+  - name: Include shared config file
+    include_vars:
+      file: "{{ env_dir }}/shared/shared_config.yaml"
+    no_log: true
+
+  - name: Decrypt ipu user service config
+    shell: sops --decrypt {{ env_dir }}/services/ipu_user_service_config.enc.yaml > {{ env_dir }}/services/ipu_user_service_config.yaml
+    no_log: true
+
+  - name: Include ipu user service config file
+    include_vars:
+      file: "{{ env_dir }}/services/ipu_user_service_config.yaml"
+    no_log: true
+
+#    - name: Install Az CLI App Insights extension
+#      command: az extension add --name application-insights
+#
+#    - name: Lookup App Insights instrumentation key
+#      command: az monitor app-insights component show --app {{ app_insights_name }} --resource-group "{{ resource_group_name }}" --query "instrumentationKey" -o tsv
+#      register: app_insights_key
+#      no_log: true
+
+  - name: Copy resources to project.properties
+    command: mvn resources:resources
+    args:
+      chdir: "{{ source_dir }}"
+
+  - name: MVN set package version
+    set_fact:
+      version: "{{ lookup('ini', 'version type=properties file={{ source_dir }}/target/classes/project.properties') }}"
+    when: version == ""
+
+  - name: Pull AKS cluster config
+    command: az aks get-credentials --resource-group "{{ resource_group_name }}" --name {{ aks_name }} --admin
+
+  - name: Connect to Helm Registry
+    shell: >
+      echo "{{ service_principal_secret }}" | helm registry login {{ docker_registry }}
+      --username "{{ service_principal_id }}" --password-stdin
+    register: connect_helm
+    until: connect_helm.rc == 0
+    retries: 3
+    delay: 15
+
+  - name: Add Helm Chart repository from an Azure Container Registry to manage helm charts
+    command: az acr helm repo add --name {{ acr_name }}
+
+  - name: Pull Helm chart
+    command: helm pull oci://{{ docker_registry }}/helm/{{ service_name }} --version {{ version }}
+    args:
+      chdir: "{{ source_dir }}/"
+    register: pull_helm
+    until: pull_helm.rc == 0
+    retries: 3
+    delay: 15
+
+#  - name: Download Helm Chart
+#    command: helm chart export {{ docker_registry }}/helm/{{ service_name }}:{{ version }} -d .
+#    args:
+#      chdir: "{{ source_dir }}/"
+#    register: download_helm
+#    until: download_helm.rc == 0
+#    retries: 3
+#    delay: 15
+
+  - name: Untar Helm Chart for deployment
+    unarchive:
+      src: "{{ source_dir }}/{{ service_name }}-{{ version }}.tgz"
+      dest: "{{ source_dir }}/"
+
+  - name: Set Helm Vars
+    template:
+      src: "{{ source_dir }}/cicd/ansible/helm_vars.yaml.j2"
+      dest: "{{ source_dir }}/helm_vars.yaml"
+
+#    Add app insights key (when ready)
+#    --set-string app_insights_instrumentation_key={{ app_insights_key.stdout }}
+
+  - name: Render Kubernetes Resources from Helm Chart and Deploy
+    shell: >
+      helm upgrade --install {{ service_name }} ./{{ service_name }}
+      -f {{ source_dir }}/helm_vars.yaml
+      --set-string replicaCount={{ pod_replica_count }}
+      --set-string image.tag={{ version }}
+      --set-string image.repository={{ docker_registry }}/{{ service_name }}
+      --set-string image.pullPolicy=Always
+      --namespace {{ ipu_namespace }}
+      --create-namespace
+      --version {{ version }}
+    args:
+      chdir: "{{ source_dir }}/"
+    #no_log: true
+
+  - name: Verify no Replica Failures ocurred during deployment in namespace {{ ipu_namespace }}
+    command: kubectl get deployments.apps -n {{ ipu_namespace }} -l app={{ service_name }} -o jsonpath='{.items[*].status.conditions[*].type}'
+    register: deployment_conditions
+    failed_when: '"ReplicaFailure" in deployment_conditions.stdout'
+
+  - name: Verify service in namespace {{ ipu_namespace }}
+    command: kubectl get service -n {{ ipu_namespace }} -l app={{ service_name }}
+    register: service
+    failed_when: '"No resources found" in service.stderr'
+
+  - name: Delete old pods if using "latest"
+    command: kubectl delete pods -n {{ ipu_namespace }} -l app={{ service_name }}
+    when: version == "latest"
+
+  - name: Verify pod is ready in namespace {{ ipu_namespace }}
+    command: kubectl get pods -n {{ ipu_namespace }} -l app={{ service_name }} -o jsonpath='{.items[*].status.containerStatuses[*].ready}'
+    register: pod
+    until: "'false' not in pod.stdout"
+    retries: 3
+    delay: 30
+
+  - name: Verify JVM is running with no errors
+    command: kubectl logs -l app={{ service_name }} -n {{ ipu_namespace }} --tail=40
+    register: logs
+    until: "'jvm running' in logs.stdout | lower"
+    retries: 3
+    delay: 60
+    failed_when: "'error' in logs.stdout | lower"

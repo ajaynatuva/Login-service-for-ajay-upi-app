@@ -1,0 +1,44 @@
+name: $(Date:yyyyMMdd)$(Rev:.r)-$(Build.SourceBranchName)
+
+trigger: none
+
+pr:
+  branches:
+    include:
+      - master
+  paths:
+    exclude:
+      - cicd
+      - charts
+      - scripts
+      - test
+      - .gitignore
+
+resources:
+  repositories:
+    - repository: templates
+      name: advancedpricing/azure-custom-templates
+      type: bitbucket
+      ref: refs/heads/master
+      endpoint: 'global_devops'
+
+variables:
+  - group: AMPS - Dev
+  - group: AMPS - Constants
+  - name: 'Email_recipient'
+    value: 'devteam_hyd@amps.com'
+
+stages:
+- stage: Build
+  jobs:
+  - job: Build
+    pool:
+      vmImage: 'ubuntu-22.04'
+    steps:
+    - template: templates/tasks/azure_pipeline_ci.yaml@templates
+- template: templates/stages/build_docker_image.yaml@templates
+- template: templates/stages/build_helm_chart.yaml@templates
+- template: templates/stages/send_email_ci.yaml@templates
+  parameters:
+        Email_recipient: '$(Email_recipient)'
+- template: templates/stages/auto_deployment.yaml@templates
